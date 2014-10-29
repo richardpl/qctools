@@ -1,5 +1,6 @@
 0.6.2, 2014-10-29
 -----
++ Ubuntu 14.10 and SUSE Linux Entreprise 12 packages
 x Memory leaks removed
 
 0.6.1, 2014-10-15

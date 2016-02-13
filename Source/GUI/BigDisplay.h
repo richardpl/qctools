@@ -10,10 +10,16 @@
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
+#include <QObject>
+#include <QMainWindow>
 #include <QDialog>
 #include <QDoubleSpinBox>
 #include <string>
+#include <sstream>
 
+#include <mpv/client.h>
+
+class QObject;
 class FFmpeg_Glue;
 class Control;
 class Info;
@@ -123,10 +129,23 @@ public:
     // Content
     Control*                    ControlArea;
 
+private Q_SLOTS:
+    void                        on_mpv_events();
+
+private:
+    void                        handle_mpv_event(mpv_event *event);
+
+Q_SIGNALS:
+    void                        mpv_events();
+
 protected:
     // File information
     FileInformation*            FileInfoData;
     int                         Frames_Pos;
+
+    // MPV
+    mpv_handle*                 MPV;
+    QWidget*                    MPV_Container;
 
     // Filters
     FFmpeg_Glue*                Picture;

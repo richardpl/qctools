@@ -24,6 +24,7 @@
 #include <QSlider>
 #include <QDoubleSpinBox>
 #include <QMenu>
+#include <QMainWindow>
 #include <QCheckBox>
 #include <QLabel>
 #include <QToolButton>
@@ -40,7 +41,11 @@
 #include <QShortcut>
 #include <QApplication>
 
+#include <mpv/qthelper.hpp>
+
+#include <clocale>
 #include <sstream>
+#include <stdexcept>
 //---------------------------------------------------------------------------
 
 
@@ -820,73 +825,11 @@ ImageLabel::ImageLabel(FFmpeg_Glue** Picture_, size_t Pos_, QWidget *parent) :
 //---------------------------------------------------------------------------
 void ImageLabel::paintEvent(QPaintEvent *event)
 {
-    //QWidget::paintEvent(event);
-
-    QPainter painter(this);
-    if (!*Picture)
-    {
-        painter.drawPixmap(0, 0, QPixmap().scaled(event->rect().width(), event->rect().height()));
-        return;
-    }
-
-    /*
-    painter.setRenderHint(QPainter::Antialiasing);
-
-    QSize pixSize = Pixmap.size();
-    pixSize.scale(event->rect().size(), Qt::KeepAspectRatio);
-
-    QPixmap scaledPix = Pixmap.scaled(pixSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    */
-
-    QImage* Image;
-    switch (Pos)
-    {
-        case 1 : Image=(*Picture)->Image_Get(0); break;
-        case 2 : Image=(*Picture)->Image_Get(1); break;
-        default: return;
-    }
-    if (!Image)
-    {
-        painter.drawPixmap(0, 0, QPixmap().scaled(event->rect().width(), event->rect().height()));
-        return;
-    }
-
-    QSize Size = event->rect().size();
-    if (Pixmap_MustRedraw || Size.width()!=Pixmap.width() || Size.height()!=Pixmap.height())
-    {
-        if (IsMain && (Size.width()!=Pixmap.width() || Size.height()!=Pixmap.height()))
-        {
-            (*Picture)->Scale_Change(Size.width(), Size.height());
-            switch (Pos)
-            {
-                case 1 : Image=(*Picture)->Image_Get(0); break;
-                case 2 : Image=(*Picture)->Image_Get(1); break;
-                default: return;
-            }
-            if (!Image)
-            {
-                painter.drawPixmap(0, 0, QPixmap().scaled(event->rect().width(), event->rect().height()));
-                return;
-            }
-        }
-        #if QT_VERSION>0x040700
-            Pixmap.convertFromImage(*Image);
-        #else //QT_VERSION>0x040700
-            Pixmap=QPixmap::fromImage(*Image);
-        #endif //QT_VERSION>0x040700
-        Pixmap_MustRedraw=false;
-    }
-
-    painter.drawPixmap((event->rect().width()-Pixmap.size().width())/2, (event->rect().height()-Pixmap.size().height())/2, Pixmap);
 }
 
 //---------------------------------------------------------------------------
 void ImageLabel::Remove ()
 {
-    Pixmap=QPixmap();
-    resize(0, 0);
-    repaint();
-    setVisible(false);
 }
 
 //***************************************************************************
@@ -965,13 +908,13 @@ void DoubleSpinBoxWithSlider::enterEvent (QEvent* event)
         Slider->setMaximum(Max);
         Slider->setToolTip(toolTip());
         Slider->setGeometry(x()+width()-(255+30), y()+height(), 255+30, height());
-        connect(Slider, SIGNAL(valueChanged(int)), this, SLOT(on_sliderMoved(int)));
-        connect(Slider, SIGNAL(sliderMoved(int)), this, SLOT(on_sliderMoved(int)));
+        //connect(Slider, SIGNAL(valueChanged(int)), this, SLOT(on_sliderMoved(int)));
+        //connect(Slider, SIGNAL(sliderMoved(int)), this, SLOT(on_sliderMoved(int)));
         Slider->setFocusPolicy(Qt::NoFocus);
         //Layout->addWidget(Slider);
         //Popup->setFocusPolicy(Qt::NoFocus);
         //Popup->setLayout(Layout);
-        connect(this, SIGNAL(valueChanged(double)), this, SLOT(on_valueChanged(double)));
+        //connect(this, SIGNAL(valueChanged(double)), this, SLOT(on_valueChanged(double)));
     }
     for (size_t Pos=0; Pos<Args_Max; Pos++)
         if (Others[Pos] && Others[Pos]!=this)
@@ -1122,6 +1065,16 @@ double DoubleSpinBoxWithSlider::valueFromText (const QString& text) const
         return QDoubleSpinBox::valueFromText(text);
 }
 
+static void wakeup(void *ctx)
+{
+    // This callback is invoked from any mpv thread (but possibly also
+    // recursively from a thread that is calling the mpv API). Just notify
+    // the Qt GUI thread to wake up (so that it can process events with
+    // mpv_wait_event()), and return as quickly as possible.
+    BigDisplay *bigdisplay = (BigDisplay *)ctx;
+    Q_EMIT bigdisplay->mpv_events();
+}
+
 //***************************************************************************
 // Constructor / Destructor
 //***************************************************************************
@@ -1132,12 +1085,38 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
     FileInfoData(FileInformationData_)
 {
     setlocale(LC_NUMERIC, "C");
+
+    MPV = mpv_create();
+    if (!MPV)
+        throw std::runtime_error("can't create mpv instance");
+
+    MPV_Container = new QWidget(this);
+    MPV_Container->setAttribute(Qt::WA_DontCreateNativeAncestors);
+    MPV_Container->setAttribute(Qt::WA_NativeWindow);
+
+    int64_t wid = MPV_Container->winId();
+    mpv_set_option(MPV, "wid", MPV_FORMAT_INT64, &wid);
+    mpv_set_option_string(MPV, "input-default-bindings", "no");
+    mpv_set_option_string(MPV, "input-vo-keyboard", "no");
+    mpv_set_option_string(MPV, "vo", "x11");
+    mpv_observe_property(MPV, 0, "time-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(MPV, 0, "percent-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(MPV, 0, "track-list", MPV_FORMAT_NODE);
+    mpv_observe_property(MPV, 0, "chapter-list", MPV_FORMAT_NODE);
+    mpv_request_log_messages(MPV, "info");
+
+    connect(this, SIGNAL(mpv_events(void)), this, SLOT(on_mpv_events(void)), Qt::QueuedConnection);
+    mpv_set_wakeup_callback(MPV, wakeup, this);
+
     setWindowTitle("QCTools - "+FileInfoData->FileName);
     setWindowFlags(windowFlags() | Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint);
     setWindowFlags(windowFlags() &(0xFFFFFFFF-Qt::WindowContextHelpButtonHint));
     resize(QDesktopWidget().screenGeometry().width()*2/5, QDesktopWidget().screenGeometry().height()*2/5);
 
-    // FiltersListDefault_Count
+    if (mpv_initialize(MPV) < 0)
+        throw std::runtime_error("mpv failed to initialize");
+
+     // FiltersListDefault_Count
     FiltersListDefault_Count=0;
     while (strcmp(Filters[FiltersListDefault_Count].Name, "(End)"))
         FiltersListDefault_Count++;
@@ -1167,73 +1146,54 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
     Layout->setSpacing(0);
 
     // Filters
-    for (size_t Pos=0; Pos<2; Pos++)
-    {
-        Options[Pos].FiltersList=new QComboBox(this);
-        Options[Pos].FiltersList->setFont(Font);
-        for (size_t FilterPos=0; FilterPos<FiltersListDefault_Count; FilterPos++)
-        {
-            if (strcmp(Filters[FilterPos].Name, "(Separator)") && strcmp(Filters[FilterPos].Name, "(End)"))
-                Options[Pos].FiltersList->addItem(Filters[FilterPos].Name);
-            else if (strcmp(Filters[FilterPos].Name, "(End)"))
-                Options[Pos].FiltersList->insertSeparator(FiltersListDefault_Count);
-        }
-        Options[Pos].FiltersList->setMinimumWidth(Options[Pos].FiltersList->minimumSizeHint().width());
-        Options[Pos].FiltersList->setMaximumWidth(Options[Pos].FiltersList->minimumSizeHint().width());
-        Options[Pos].FiltersList->setMaxVisibleItems(25);
-    }
+    //for (size_t Pos=0; Pos<2; Pos++)
+    //{
+    //    Options[Pos].FiltersList=new QComboBox(this);
+    //    Options[Pos].FiltersList->setFont(Font);
+    //    for (size_t FilterPos=0; FilterPos<FiltersListDefault_Count; FilterPos++)
+    //    {
+    //        if (strcmp(Filters[FilterPos].Name, "(Separator)") && strcmp(Filters[FilterPos].Name, "(End)"))
+    //            Options[Pos].FiltersList->addItem(Filters[FilterPos].Name);
+    //        else if (strcmp(Filters[FilterPos].Name, "(End)"))
+    //            Options[Pos].FiltersList->insertSeparator(FiltersListDefault_Count);
+    //    }
+    //    Options[Pos].FiltersList->setMinimumWidth(Options[Pos].FiltersList->minimumSizeHint().width());
+    //    Options[Pos].FiltersList->setMaximumWidth(Options[Pos].FiltersList->minimumSizeHint().width());
+    //    Options[Pos].FiltersList->setMaxVisibleItems(25);
+    //}
 
-    //Image1
-    Image1=new ImageLabel(&Picture, 1, this);
-    Image1->IsMain=true;
-    Image1->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    Image1->setMinimumSize(20, 20);
-    //Layout->addWidget(Image1, 1, 0, 1, 1);
-    //Layout->setColumnStretch(0, 1);
+    InfoArea=NULL;
 
-    //Image2
-    Image2=new ImageLabel(&Picture, 2, this);
-    Image2->IsMain=false;
-    Image2->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    Image2->setMinimumSize(20, 20);
-    //Layout->addWidget(Image2, 1, 2, 1, 1);
-    //Layout->setColumnStretch(2, 1);
-
-    // Mixing Image1 and Image2 in one widget
-    QHBoxLayout* ImageLayout=new QHBoxLayout();
+    QVBoxLayout* ImageLayout=new QVBoxLayout();
     ImageLayout->setContentsMargins(0, -1, 0, 0);
     ImageLayout->setSpacing(0);
-    ImageLayout->addWidget(Image1);
-    ImageLayout->addWidget(Image2);
-    Layout->addLayout(ImageLayout, 1, 0, 1, 3);
+    ImageLayout->addWidget(MPV_Container, 1);
 
-    // Info
-    InfoArea=NULL;
-    //InfoArea=new Info(this, FileInfoData, Info::Style_Columns);
-    //Layout->addWidget(InfoArea, 1, 1, 1, 3, Qt::AlignHCenter);
-    //Layout->addItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Expanding), 2, 1, 1, 3, Qt::AlignHCenter);
-
+    QVBoxLayout* ControlsLayout =new QVBoxLayout();
     // Slider
     Slider=new QSlider(Qt::Horizontal);
     Slider->setMaximum(FileInfoData->Glue->VideoFrameCount_Get());
-    connect(Slider, SIGNAL(sliderMoved(int)), this, SLOT(on_Slider_sliderMoved(int)));
-    connect(Slider, SIGNAL(actionTriggered(int)), this, SLOT(on_Slider_actionTriggered(int)));
-    Layout->addWidget(Slider, 2, 0, 1, 3);
+    //connect(Slider, SIGNAL(sliderMoved(int)), this, SLOT(on_Slider_sliderMoved(int)));
+    //connect(Slider, SIGNAL(actionTriggered(int)), this, SLOT(on_Slider_actionTriggered(int)));
+    ControlsLayout->addWidget(Slider);
 
     // Control
     ControlArea=new Control(this, FileInfoData, Control::Style_Cols, true);
-    Layout->addWidget(ControlArea, 3, 0, 1, 3, Qt::AlignBottom);
+    ControlsLayout->addWidget(ControlArea);
+    Layout->addLayout(ImageLayout, 2, 1, 1, 15);
+    Layout->addLayout(ControlsLayout, 3, 1, 1, 15);
+    Layout->setRowStretch(2, 15);
+    Layout->setColumnStretch(2, 15);
+    Layout->setColumnStretch(3, 15);
 
     setLayout(Layout);
 
-    // Picture
-    Picture=NULL;
     Picture_Current1=Filters_Default1;
     Picture_Current2=Filters_Default2;
-    Options[0].FiltersList->setCurrentIndex(Picture_Current1);
-    Options[1].FiltersList->setCurrentIndex(Picture_Current2);
-    connect(Options[0].FiltersList, SIGNAL(currentIndexChanged(int)), this, SLOT(on_FiltersList1_currentIndexChanged(int)));
-    connect(Options[1].FiltersList, SIGNAL(currentIndexChanged(int)), this, SLOT(on_FiltersList2_currentIndexChanged(int)));
+    //Options[0].FiltersList->setCurrentIndex(Picture_Current1);
+    //Options[1].FiltersList->setCurrentIndex(Picture_Current2);
+    //connect(Options[0].FiltersList, SIGNAL(currentIndexChanged(int)), this, SLOT(on_FiltersList1_currentIndexChanged(int)));
+    //connect(Options[1].FiltersList, SIGNAL(currentIndexChanged(int)), this, SLOT(on_FiltersList2_currentIndexChanged(int)));
 
     // Info
     Frames_Pos=-1;
@@ -1259,7 +1219,60 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
 //---------------------------------------------------------------------------
 BigDisplay::~BigDisplay()
 {
-    delete Picture;
+    mpv_terminate_destroy(MPV);
+    MPV = NULL;
+}
+
+// This slot is invoked by wakeup() (through the mpv_events signal).
+void BigDisplay::on_mpv_events()
+{
+    // Process all events, until the event queue is empty.
+    while (MPV) {
+        mpv_event *event = mpv_wait_event(MPV, 0);
+        if (event->event_id == MPV_EVENT_NONE)
+            break;
+        handle_mpv_event(event);
+    }
+}
+
+void BigDisplay::handle_mpv_event(mpv_event *event)
+{
+    switch (event->event_id) {
+    case MPV_EVENT_PROPERTY_CHANGE: {
+        mpv_event_property *prop = (mpv_event_property *)event->data;
+        if (strcmp(prop->name, "time-pos") == 0) {
+            if (prop->format == MPV_FORMAT_DOUBLE) {
+                double time = *(double *)prop->data;
+            } else if (prop->format == MPV_FORMAT_NONE) {
+                // The property is unavailable, which probably means playback
+                // was stopped.
+            }
+        } else if (strcmp(prop->name, "chapter-list") == 0 ||
+                   strcmp(prop->name, "track-list") == 0) {
+        } else if (strcmp(prop->name, "percent-pos") == 0) {
+            if (prop->format == MPV_FORMAT_DOUBLE) {
+                double pos = *(double *)prop->data;
+                Frames_Pos = FileInfoData->Frames_Count_Get() * pos / 100.;
+                if (Slider->sliderPosition()!=Frames_Pos)
+                    Slider->setSliderPosition(Frames_Pos);
+            }
+        }
+            break;
+    }
+    case MPV_EVENT_VIDEO_RECONFIG: {
+        break;
+    }
+    case MPV_EVENT_LOG_MESSAGE: {
+        break;
+    }
+    case MPV_EVENT_SHUTDOWN: {
+        mpv_terminate_destroy(MPV);
+        MPV = NULL;
+        break;
+    }
+    default: ;
+        // Ignore uninteresting or unknown events.
+    }
 }
 
 //---------------------------------------------------------------------------
@@ -1529,49 +1542,11 @@ void BigDisplay::FiltersList_currentIndexChanged(size_t Pos, size_t FilterPos, Q
 //---------------------------------------------------------------------------
 void BigDisplay::FiltersList1_currentIndexChanged(size_t FilterPos)
 {
-    QGridLayout* Layout0=new QGridLayout();
-    Layout0->setContentsMargins(0, 0, 0, 0);
-    Layout0->setSpacing(8);
-    Layout0->addWidget(Options[0].FiltersList, 0, 0, Qt::AlignLeft);
-    FiltersList_currentIndexChanged(0, FilterPos, Layout0);
-    Options[0].FiltersList_Fake=new QLabel(" ");
-    Options[0].FiltersList_Fake->setMinimumHeight(24);
-    Layout0->addWidget(Options[0].FiltersList_Fake, 1, 0, Qt::AlignLeft);
-    Layout0->addItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Minimum), 0, 14);
-    Layout->addLayout(Layout0, 0, 0, 1, 1, Qt::AlignLeft|Qt::AlignTop);
-
-    if (Picture_Current1<2)
-    {
-        Image1->setVisible(true);
-        Layout->setColumnStretch(0, 1);
-        //resize(width()+Image_Width, height());
-    }
-    Picture_Current1=FilterPos;
-    FiltersList1_currentOptionChanged(Picture_Current1);
 }
 
 //---------------------------------------------------------------------------
 void BigDisplay::FiltersList2_currentIndexChanged(size_t FilterPos)
 {
-    QGridLayout* Layout0=new QGridLayout();
-    Layout0->setContentsMargins(0, 0, 0, 0);
-    Layout0->setSpacing(8);
-    Layout0->addItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Minimum), 0, 0);
-    FiltersList_currentIndexChanged(1, FilterPos, Layout0);
-    Layout0->addWidget(Options[1].FiltersList, 0, 14, Qt::AlignRight);
-    Options[1].FiltersList_Fake=new QLabel(" ");
-    Options[1].FiltersList_Fake->setMinimumHeight(24);
-    Layout0->addWidget(Options[1].FiltersList_Fake, 1, 14, Qt::AlignRight);
-    Layout->addLayout(Layout0, 0, 2, 1, 1, Qt::AlignRight|Qt::AlignTop);
-
-    if (Picture_Current2<2)
-    {
-        Image2->setVisible(true);
-        Layout->setColumnStretch(2, 1);
-        //resize(width()+Image_Width, height());
-    }
-    Picture_Current2=FilterPos;
-    FiltersList2_currentOptionChanged(Picture_Current2);
 }
 
 //---------------------------------------------------------------------------
@@ -1888,20 +1863,16 @@ string BigDisplay::FiltersList_currentOptionChanged(size_t Pos, size_t Picture_C
 void BigDisplay::FiltersList1_currentOptionChanged(size_t Picture_Current)
 {
     string Modified_String=FiltersList_currentOptionChanged(0, Picture_Current);
-    Picture->Filter_Change(0, Filters[Picture_Current1].Type, Modified_String.c_str());
 
     Frames_Pos=(size_t)-1;
-    ShowPicture ();
 }
 
 //---------------------------------------------------------------------------
 void BigDisplay::FiltersList2_currentOptionChanged(size_t Picture_Current)
 {
     string Modified_String=FiltersList_currentOptionChanged(1, Picture_Current);
-    Picture->Filter_Change(1, Filters[Picture_Current2].Type, Modified_String.c_str());
 
     Frames_Pos=(size_t)-1;
-    ShowPicture ();
 }
 
 //***************************************************************************
@@ -1911,6 +1882,11 @@ void BigDisplay::FiltersList2_currentOptionChanged(size_t Picture_Current)
 //---------------------------------------------------------------------------
 void BigDisplay::ShowPicture ()
 {
+    const char *args1[] = {"loadfile", FileInfoData->FileName.toUtf8(), NULL};
+    mpv_command(MPV, args1);
+    const char *args2[] = {"vf", "set", "lavfi=[split=2,hstack=2]", NULL};
+    mpv_command(MPV, args2);
+
     if (!isVisible())
         return;
 
@@ -1920,47 +1896,9 @@ void BigDisplay::ShowPicture ()
     Frames_Pos=FileInfoData->Frames_Pos_Get();
     ShouldUpate=false;
 
-    // Picture
-    if (!Picture)
-    {
-        string FileName_string=FileInfoData->FileName.toUtf8().data();
-        #ifdef _WIN32
-            replace(FileName_string.begin(), FileName_string.end(), '/', '\\' );
-        #endif
-        int width=QDesktopWidget().screenGeometry().width()*2/5;
-        if (width%2)
-            width--; //odd number is wanted for filters
-        int height=QDesktopWidget().screenGeometry().height()*2/5;
-        if (height%2)
-            height--; //odd number is wanted for filters
-        Picture=new FFmpeg_Glue(FileName_string.c_str(), FileInfoData->ActiveAllTracks, &FileInfoData->Stats);
-        if (FileName_string.empty())
-            Picture->InputData_Set(FileInfoData->Glue->InputData_Get()); // Using data from the analyzed file
-        Picture->AddOutput(0, width, height, FFmpeg_Glue::Output_QImage);
-        Picture->AddOutput(1, width, height, FFmpeg_Glue::Output_QImage);
-        FiltersList1_currentIndexChanged(Picture_Current1);
-        FiltersList2_currentIndexChanged(Picture_Current2);
-    }
-    Picture->FrameAtPosition(Frames_Pos);
-    if (Picture->Image_Get(0))
-    {
-        Image_Width=Picture->Image_Get(0)->width();
-        Image_Height=Picture->Image_Get(0)->height();
-    }
-
-    if (Slider->sliderPosition()!=Frames_Pos)
-        Slider->setSliderPosition(Frames_Pos);
-
-    Image1->Pixmap_MustRedraw=true;
-    Image1->repaint();
-    Image2->Pixmap_MustRedraw=true;
-    Image2->repaint();
-
     // Stats
-    if (ControlArea)
-        ControlArea->Update();
-    if (InfoArea)
-        InfoArea->Update();
+    //if (ControlArea)
+    //    ControlArea->Update();
 }
 
 //***************************************************************************
@@ -1970,8 +1908,6 @@ void BigDisplay::ShowPicture ()
 //---------------------------------------------------------------------------
 void BigDisplay::on_Slider_sliderMoved(int value)
 {
-    ControlArea->Pause->click();
-
     FileInfoData->Frames_Pos_Set(value);
 }
 
@@ -1981,15 +1917,13 @@ void BigDisplay::on_Slider_actionTriggered(int action )
     if (action==QAbstractSlider::SliderMove)
         return;
 
-    ControlArea->Pause->click();
-
     FileInfoData->Frames_Pos_Set(Slider->sliderPosition());
 }
 
 //---------------------------------------------------------------------------
 void BigDisplay::on_FiltersSource_stateChanged(int state)
 {
-    ShowPicture ();
+    //ShowPicture ();
 }
 
 //---------------------------------------------------------------------------
@@ -2133,14 +2067,9 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(QAction * action)
     // None
     if (action->text()=="No display")
     {
-        Picture->Disable(0);
-        Image1->Remove();
         Layout->setColumnStretch(0, 0);
         //move(pos().x()+Image_Width, pos().y());
         //adjustSize();
-        Picture_Current1=1;
-        Image1->IsMain=false;
-        Image2->IsMain=true;
         repaint();
         return;
     }
@@ -2153,19 +2082,13 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(QAction * action)
         {
             if (Picture_Current1<2)
             {
-                Image1->setVisible(true);
-                Image1->IsMain=true;
-                Image2->IsMain=false;
                 Layout->setColumnStretch(0, 1);
                 //move(pos().x()-Image_Width, pos().y());
                 //resize(width()+Image_Width, height());
             }
             Picture_Current1=Pos;
-            //Picture->Filter1_Change(Filters[Pos].Formula[0]);
-            Picture->Filter_Change(0, 0, FiltersList_currentOptionChanged(Pos, 0));
 
             Frames_Pos=(size_t)-1;
-            ShowPicture ();
             return;
         }
     }
@@ -2185,21 +2108,14 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(int Pos)
     // None
     if (Pos==1)
     {
-        Picture->Disable(0);
-        Image1->Remove();
         Layout->setColumnStretch(0, 0);
         //move(pos().x()+Image_Width, pos().y());
         //adjustSize();
-        Image1->IsMain=false;
-        Image2->IsMain=true;
         repaint();
     }
 
     if (Picture_Current1<2)
     {
-        Image1->setVisible(true);
-        Image1->IsMain=true;
-        Image2->IsMain=false;
         Layout->setColumnStretch(0, 1);
         //move(pos().x()-Image_Width, pos().y());
         //resize(width()+Image_Width, height());
@@ -2207,7 +2123,6 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(int Pos)
     FiltersList1_currentIndexChanged(Pos);
 
     Frames_Pos=(size_t)-1;
-    ShowPicture ();
 }
 
 //---------------------------------------------------------------------------
@@ -2224,8 +2139,6 @@ void BigDisplay::on_FiltersList2_currentIndexChanged(int Pos)
     // None
     if (Pos==1)
     {
-        Picture->Disable(1);
-        Image2->Remove();
         Layout->setColumnStretch(2, 0);
         //adjustSize();
         repaint();
@@ -2248,11 +2161,8 @@ void BigDisplay::on_FiltersList2_currentIndexChanged(QAction * action)
     // None
     if (action->text()=="No display")
     {
-        Picture->Disable(1);
-        Image2->Remove();
         Layout->setColumnStretch(2, 0);
         //adjustSize();
-        Picture_Current2=1;
         repaint();
         return;
     }
@@ -2274,34 +2184,6 @@ void BigDisplay::resizeEvent(QResizeEvent* Event)
 {
     if (Event->oldSize().width()<0 || Event->oldSize().height()<0)
         return;
-
-    /*int DiffX=(Event->size().width()-Event->oldSize().width())/2;
-    int DiffY=(Event->size().width()-Event->oldSize().width())/2;
-    Picture->Scale_Change(Image_Width+DiffX, Image_Height+DiffY);
-
-    Frames_Pos=(size_t)-1;
-    ShowPicture ();*/
-    int SizeX=(Event->size().width()-(InfoArea?InfoArea->width():0))/2-25;
-    int SizeY=(Event->size().height()-Slider->height())-50;
-
-    /*if (InfoArea->height()+FiltersList1->height()+Slider->height()+ControlArea->height()+50>=Event->size().height())
-    {
-        InfoArea->hide();
-        Layout->removeWidget(InfoArea);
-    }
-    else
-    {
-        Layout->addWidget(InfoArea, 0, 1, 1, 3, Qt::AlignLeft);
-        InfoArea->show();
-    }*/
-
-    //adjust();
-    //Picture->Scale_Change(Image1->width(), Image1->height());
-
-    //Frames_Pos=(size_t)-1;
-    //ShowPicture ();
-    Image1->Pixmap_MustRedraw=true;
-    Image2->Pixmap_MustRedraw=true;
 }
 
 //---------------------------------------------------------------------------

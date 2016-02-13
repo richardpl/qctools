@@ -8,6 +8,8 @@ TEMPLATE = app
 
 CONFIG += qt release
 CONFIG += no_keywords
+CONFIG += link_pkgconfig
+PKGCONFIG += mpv
 
 HEADERS = \
     ../../Source/Core/AudioCore.h \

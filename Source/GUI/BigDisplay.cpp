@@ -40,7 +40,11 @@
 #include <QShortcut>
 #include <QApplication>
 
+#include <mpv/qthelper.hpp>
+
+#include <string>
 #include <sstream>
+#include <stdexcept>
 //---------------------------------------------------------------------------
 
 
@@ -808,76 +812,8 @@ const filter Filters[]=
 //***************************************************************************
 
 //---------------------------------------------------------------------------
-ImageLabel::ImageLabel(FFmpeg_Glue** Picture_, size_t Pos_, QWidget *parent) :
-    QWidget(parent),
-    Picture(Picture_),
-    Pos(Pos_)
-{
-    Pixmap_MustRedraw=false;
-    IsMain=true;
-}
-
-//---------------------------------------------------------------------------
 void ImageLabel::paintEvent(QPaintEvent *event)
 {
-    //QWidget::paintEvent(event);
-
-    QPainter painter(this);
-    if (!*Picture)
-    {
-        painter.drawPixmap(0, 0, QPixmap().scaled(event->rect().width(), event->rect().height()));
-        return;
-    }
-
-    /*
-    painter.setRenderHint(QPainter::Antialiasing);
-
-    QSize pixSize = Pixmap.size();
-    pixSize.scale(event->rect().size(), Qt::KeepAspectRatio);
-
-    QPixmap scaledPix = Pixmap.scaled(pixSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    */
-
-    QImage* Image;
-    switch (Pos)
-    {
-        case 1 : Image=(*Picture)->Image_Get(0); break;
-        case 2 : Image=(*Picture)->Image_Get(1); break;
-        default: return;
-    }
-    if (!Image)
-    {
-        painter.drawPixmap(0, 0, QPixmap().scaled(event->rect().width(), event->rect().height()));
-        return;
-    }
-
-    QSize Size = event->rect().size();
-    if (Pixmap_MustRedraw || Size.width()!=Pixmap.width() || Size.height()!=Pixmap.height())
-    {
-        if (IsMain && (Size.width()!=Pixmap.width() || Size.height()!=Pixmap.height()))
-        {
-            (*Picture)->Scale_Change(Size.width(), Size.height());
-            switch (Pos)
-            {
-                case 1 : Image=(*Picture)->Image_Get(0); break;
-                case 2 : Image=(*Picture)->Image_Get(1); break;
-                default: return;
-            }
-            if (!Image)
-            {
-                painter.drawPixmap(0, 0, QPixmap().scaled(event->rect().width(), event->rect().height()));
-                return;
-            }
-        }
-        #if QT_VERSION>0x040700
-            Pixmap.convertFromImage(*Image);
-        #else //QT_VERSION>0x040700
-            Pixmap=QPixmap::fromImage(*Image);
-        #endif //QT_VERSION>0x040700
-        Pixmap_MustRedraw=false;
-    }
-
-    painter.drawPixmap((event->rect().width()-Pixmap.size().width())/2, (event->rect().height()-Pixmap.size().height())/2, Pixmap);
 }
 
 //---------------------------------------------------------------------------
@@ -1122,6 +1058,12 @@ double DoubleSpinBoxWithSlider::valueFromText (const QString& text) const
         return QDoubleSpinBox::valueFromText(text);
 }
 
+static void wakeup(void *ctx)
+{
+    BigDisplay *bigdisplay = (BigDisplay *)ctx;
+    Q_EMIT bigdisplay->mpv_events();
+}
+
 //***************************************************************************
 // Constructor / Destructor
 //***************************************************************************
@@ -1132,6 +1074,52 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
     FileInfoData(FileInformationData_)
 {
     setlocale(LC_NUMERIC, "C");
+
+    MPVl = mpv_create();
+    if (!MPVl)
+        throw std::runtime_error("can't create mpv instance");
+
+    MPVr = mpv_create();
+    if (!MPVr)
+        throw std::runtime_error("can't create mpv instance");
+
+    MPV_Container_l = new QWidget(this);
+    MPV_Container_l->setAttribute(Qt::WA_DontCreateNativeAncestors);
+    MPV_Container_l->setAttribute(Qt::WA_NativeWindow);
+
+    MPV_Container_r = new QWidget(this);
+    MPV_Container_r->setAttribute(Qt::WA_DontCreateNativeAncestors);
+    MPV_Container_r->setAttribute(Qt::WA_NativeWindow);
+
+    int64_t wid = MPV_Container_l->winId();
+    mpv_set_option(MPVl, "wid", MPV_FORMAT_INT64, &wid);
+    mpv_set_option_string(MPVl, "input-default-bindings", "no");
+    mpv_set_option_string(MPVl, "input-vo-keyboard", "no");
+    mpv_observe_property(MPVl, 0, "time-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(MPVl, 0, "percent-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(MPVl, 0, "track-list", MPV_FORMAT_NODE);
+    mpv_observe_property(MPVl, 0, "chapter-list", MPV_FORMAT_NODE);
+    mpv_request_log_messages(MPVl, "info");
+
+    wid = MPV_Container_r->winId();
+    mpv_set_option(MPVr, "wid", MPV_FORMAT_INT64, &wid);
+    mpv_set_option_string(MPVr, "input-default-bindings", "no");
+    mpv_set_option_string(MPVr, "input-vo-keyboard", "no");
+    mpv_observe_property(MPVr, 0, "time-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(MPVr, 0, "percent-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(MPVr, 0, "track-list", MPV_FORMAT_NODE);
+    mpv_observe_property(MPVr, 0, "chapter-list", MPV_FORMAT_NODE);
+    mpv_request_log_messages(MPVr, "info");
+
+    connect(this, SIGNAL(mpv_events(void)), this, SLOT(on_mpv_events(void)), Qt::QueuedConnection);
+    mpv_set_wakeup_callback(MPVl, wakeup, this);
+    mpv_set_wakeup_callback(MPVr, wakeup, this);
+
+    if (mpv_initialize(MPVl) < 0)
+        throw std::runtime_error("mpv failed to initialize");
+    if (mpv_initialize(MPVr) < 0)
+        throw std::runtime_error("mpv failed to initialize");
+
     setWindowTitle("QCTools - "+FileInfoData->FileName);
     setWindowFlags(windowFlags() | Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint);
     setWindowFlags(windowFlags() &(0xFFFFFFFF-Qt::WindowContextHelpButtonHint));
@@ -1184,18 +1172,18 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
     }
 
     //Image1
-    Image1=new ImageLabel(&Picture, 1, this);
-    Image1->IsMain=true;
-    Image1->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    Image1->setMinimumSize(20, 20);
+    //Image1=new ImageLabel(&Picture, 1, this);
+    //Image1->IsMain=true;
+    //Image1->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    //Image1->setMinimumSize(20, 20);
     //Layout->addWidget(Image1, 1, 0, 1, 1);
     //Layout->setColumnStretch(0, 1);
 
     //Image2
-    Image2=new ImageLabel(&Picture, 2, this);
-    Image2->IsMain=false;
-    Image2->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    Image2->setMinimumSize(20, 20);
+    //Image2=new ImageLabel(&Picture, 2, this);
+    //Image2->IsMain=false;
+    //Image2->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    //Image2->setMinimumSize(20, 20);
     //Layout->addWidget(Image2, 1, 2, 1, 1);
     //Layout->setColumnStretch(2, 1);
 
@@ -1203,8 +1191,8 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
     QHBoxLayout* ImageLayout=new QHBoxLayout();
     ImageLayout->setContentsMargins(0, -1, 0, 0);
     ImageLayout->setSpacing(0);
-    ImageLayout->addWidget(Image1);
-    ImageLayout->addWidget(Image2);
+    ImageLayout->addWidget(MPV_Container_l);
+    ImageLayout->addWidget(MPV_Container_r);
     Layout->addLayout(ImageLayout, 1, 0, 1, 3);
 
     // Info
@@ -1227,7 +1215,7 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
     setLayout(Layout);
 
     // Picture
-    Picture=NULL;
+    //Picture=NULL;
     Picture_Current1=Filters_Default1;
     Picture_Current2=Filters_Default2;
     Options[0].FiltersList->setCurrentIndex(Picture_Current1);
@@ -1259,7 +1247,63 @@ BigDisplay::BigDisplay(QWidget *parent, FileInformation* FileInformationData_) :
 //---------------------------------------------------------------------------
 BigDisplay::~BigDisplay()
 {
-    delete Picture;
+    //delete Picture;
+    mpv_terminate_destroy(MPVl);
+    mpv_terminate_destroy(MPVr);
+    MPVl = NULL;
+    MPVr = NULL;
+}
+
+// This slot is invoked by wakeup() (through the mpv_events signal).
+void BigDisplay::on_mpv_events()
+{
+    // Process all events, until the event queue is empty.
+    while (MPVl) {
+        mpv_event *event = mpv_wait_event(MPVl, 0);
+        if (event->event_id == MPV_EVENT_NONE)
+            break;
+        handle_mpv_event(event);
+    }
+}
+
+void BigDisplay::handle_mpv_event(mpv_event *event)
+{
+    switch (event->event_id) {
+    case MPV_EVENT_PROPERTY_CHANGE: {
+        mpv_event_property *prop = (mpv_event_property *)event->data;
+        if (strcmp(prop->name, "time-pos") == 0) {
+            if (prop->format == MPV_FORMAT_DOUBLE) {
+                double time = *(double *)prop->data;
+            } else if (prop->format == MPV_FORMAT_NONE) {
+                // The property is unavailable, which probably means playback
+                // was stopped.
+            }
+        } else if (strcmp(prop->name, "chapter-list") == 0 ||
+                   strcmp(prop->name, "track-list") == 0) {
+        } else if (strcmp(prop->name, "percent-pos") == 0) {
+            if (prop->format == MPV_FORMAT_DOUBLE) {
+                double pos = *(double *)prop->data;
+                Frames_Pos = FileInfoData->Frames_Count_Get() * pos / 100.;
+                if (Slider->sliderPosition()!=Frames_Pos)
+                    Slider->setSliderPosition(Frames_Pos);
+            }
+        }
+            break;
+    }
+    case MPV_EVENT_VIDEO_RECONFIG: {
+        break;
+    }
+    case MPV_EVENT_LOG_MESSAGE: {
+        break;
+    }
+    case MPV_EVENT_SHUTDOWN: {
+        mpv_terminate_destroy(MPVl);
+        MPVl = NULL;
+        break;
+    }
+    default: ;
+        // Ignore uninteresting or unknown events.
+    }
 }
 
 //---------------------------------------------------------------------------
@@ -1542,7 +1586,7 @@ void BigDisplay::FiltersList1_currentIndexChanged(size_t FilterPos)
 
     if (Picture_Current1<2)
     {
-        Image1->setVisible(true);
+        //Image1->setVisible(true);
         Layout->setColumnStretch(0, 1);
         //resize(width()+Image_Width, height());
     }
@@ -1566,7 +1610,7 @@ void BigDisplay::FiltersList2_currentIndexChanged(size_t FilterPos)
 
     if (Picture_Current2<2)
     {
-        Image2->setVisible(true);
+        //Image2->setVisible(true);
         Layout->setColumnStretch(2, 1);
         //resize(width()+Image_Width, height());
     }
@@ -1888,9 +1932,11 @@ string BigDisplay::FiltersList_currentOptionChanged(size_t Pos, size_t Picture_C
 void BigDisplay::FiltersList1_currentOptionChanged(size_t Picture_Current)
 {
     string Modified_String=FiltersList_currentOptionChanged(0, Picture_Current);
-    Picture->Filter_Change(0, Filters[Picture_Current1].Type, Modified_String.c_str());
+    string graph = string("lavfi=[") + Modified_String + string("]");
+    //Picture->Filter_Change(0, Filters[Picture_Current1].Type, Modified_String.c_str());
+    const char *args2[] = {"vf", "set", graph.c_str(), NULL};
+    mpv_command(MPVl, args2);
 
-    Frames_Pos=(size_t)-1;
     ShowPicture ();
 }
 
@@ -1898,9 +1944,11 @@ void BigDisplay::FiltersList1_currentOptionChanged(size_t Picture_Current)
 void BigDisplay::FiltersList2_currentOptionChanged(size_t Picture_Current)
 {
     string Modified_String=FiltersList_currentOptionChanged(1, Picture_Current);
-    Picture->Filter_Change(1, Filters[Picture_Current2].Type, Modified_String.c_str());
+    string graph = string("lavfi=[") + Modified_String + string("]");
+    //Picture->Filter_Change(1, Filters[Picture_Current2].Type, Modified_String.c_str());
+    const char *args2[] = {"vf", "set", graph.c_str(), NULL};
+    mpv_command(MPVr, args2);
 
-    Frames_Pos=(size_t)-1;
     ShowPicture ();
 }
 
@@ -1911,6 +1959,12 @@ void BigDisplay::FiltersList2_currentOptionChanged(size_t Picture_Current)
 //---------------------------------------------------------------------------
 void BigDisplay::ShowPicture ()
 {
+    const char *args1[] = {"loadfile", FileInfoData->FileName.toUtf8(), NULL};
+    mpv_command(MPVl, args1);
+    mpv_command(MPVr, args1);
+    //const char *args2[] = {"vf", "set", "lavfi=[split=2,hstack=2]", NULL};
+    //mpv_command(MPV, args2);
+
     if (!isVisible())
         return;
 
@@ -1919,42 +1973,6 @@ void BigDisplay::ShowPicture ()
         return;
     Frames_Pos=FileInfoData->Frames_Pos_Get();
     ShouldUpate=false;
-
-    // Picture
-    if (!Picture)
-    {
-        string FileName_string=FileInfoData->FileName.toUtf8().data();
-        #ifdef _WIN32
-            replace(FileName_string.begin(), FileName_string.end(), '/', '\\' );
-        #endif
-        int width=QDesktopWidget().screenGeometry().width()*2/5;
-        if (width%2)
-            width--; //odd number is wanted for filters
-        int height=QDesktopWidget().screenGeometry().height()*2/5;
-        if (height%2)
-            height--; //odd number is wanted for filters
-        Picture=new FFmpeg_Glue(FileName_string.c_str(), FileInfoData->ActiveAllTracks, &FileInfoData->Stats);
-        if (FileName_string.empty())
-            Picture->InputData_Set(FileInfoData->Glue->InputData_Get()); // Using data from the analyzed file
-        Picture->AddOutput(0, width, height, FFmpeg_Glue::Output_QImage);
-        Picture->AddOutput(1, width, height, FFmpeg_Glue::Output_QImage);
-        FiltersList1_currentIndexChanged(Picture_Current1);
-        FiltersList2_currentIndexChanged(Picture_Current2);
-    }
-    Picture->FrameAtPosition(Frames_Pos);
-    if (Picture->Image_Get(0))
-    {
-        Image_Width=Picture->Image_Get(0)->width();
-        Image_Height=Picture->Image_Get(0)->height();
-    }
-
-    if (Slider->sliderPosition()!=Frames_Pos)
-        Slider->setSliderPosition(Frames_Pos);
-
-    Image1->Pixmap_MustRedraw=true;
-    Image1->repaint();
-    Image2->Pixmap_MustRedraw=true;
-    Image2->repaint();
 
     // Stats
     if (ControlArea)
@@ -1989,7 +2007,6 @@ void BigDisplay::on_Slider_actionTriggered(int action )
 //---------------------------------------------------------------------------
 void BigDisplay::on_FiltersSource_stateChanged(int state)
 {
-    ShowPicture ();
 }
 
 //---------------------------------------------------------------------------
@@ -2133,14 +2150,14 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(QAction * action)
     // None
     if (action->text()=="No display")
     {
-        Picture->Disable(0);
-        Image1->Remove();
+        //Picture->Disable(0);
+        //Image1->Remove();
         Layout->setColumnStretch(0, 0);
         //move(pos().x()+Image_Width, pos().y());
         //adjustSize();
         Picture_Current1=1;
-        Image1->IsMain=false;
-        Image2->IsMain=true;
+        //Image1->IsMain=false;
+        //Image2->IsMain=true;
         repaint();
         return;
     }
@@ -2153,16 +2170,16 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(QAction * action)
         {
             if (Picture_Current1<2)
             {
-                Image1->setVisible(true);
-                Image1->IsMain=true;
-                Image2->IsMain=false;
+                //Image1->setVisible(true);
+                //Image1->IsMain=true;
+                //Image2->IsMain=false;
                 Layout->setColumnStretch(0, 1);
                 //move(pos().x()-Image_Width, pos().y());
                 //resize(width()+Image_Width, height());
             }
             Picture_Current1=Pos;
             //Picture->Filter1_Change(Filters[Pos].Formula[0]);
-            Picture->Filter_Change(0, 0, FiltersList_currentOptionChanged(Pos, 0));
+            //Picture->Filter_Change(0, 0, FiltersList_currentOptionChanged(Pos, 0));
 
             Frames_Pos=(size_t)-1;
             ShowPicture ();
@@ -2185,21 +2202,21 @@ void BigDisplay::on_FiltersList1_currentIndexChanged(int Pos)
     // None
     if (Pos==1)
     {
-        Picture->Disable(0);
-        Image1->Remove();
+        //Picture->Disable(0);
+        //Image1->Remove();
         Layout->setColumnStretch(0, 0);
         //move(pos().x()+Image_Width, pos().y());
         //adjustSize();
-        Image1->IsMain=false;
-        Image2->IsMain=true;
+        //Image1->IsMain=false;
+        //Image2->IsMain=true;
         repaint();
     }
 
     if (Picture_Current1<2)
     {
-        Image1->setVisible(true);
-        Image1->IsMain=true;
-        Image2->IsMain=false;
+        //Image1->setVisible(true);
+        //Image1->IsMain=true;
+        //Image2->IsMain=false;
         Layout->setColumnStretch(0, 1);
         //move(pos().x()-Image_Width, pos().y());
         //resize(width()+Image_Width, height());
@@ -2224,8 +2241,8 @@ void BigDisplay::on_FiltersList2_currentIndexChanged(int Pos)
     // None
     if (Pos==1)
     {
-        Picture->Disable(1);
-        Image2->Remove();
+        //Picture->Disable(1);
+        //Image2->Remove();
         Layout->setColumnStretch(2, 0);
         //adjustSize();
         repaint();
@@ -2248,8 +2265,8 @@ void BigDisplay::on_FiltersList2_currentIndexChanged(QAction * action)
     // None
     if (action->text()=="No display")
     {
-        Picture->Disable(1);
-        Image2->Remove();
+        //Picture->Disable(1);
+        //Image2->Remove();
         Layout->setColumnStretch(2, 0);
         //adjustSize();
         Picture_Current2=1;
@@ -2300,8 +2317,8 @@ void BigDisplay::resizeEvent(QResizeEvent* Event)
 
     //Frames_Pos=(size_t)-1;
     //ShowPicture ();
-    Image1->Pixmap_MustRedraw=true;
-    Image2->Pixmap_MustRedraw=true;
+    //Image1->Pixmap_MustRedraw=true;
+    //Image2->Pixmap_MustRedraw=true;
 }
 
 //---------------------------------------------------------------------------

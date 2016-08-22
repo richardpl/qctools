@@ -778,7 +778,7 @@ FFmpeg_Glue::FFmpeg_Glue (const string &FileName_, activealltracks ActiveAllTrac
     av_register_all();
     avfilter_register_all();
     //av_log_set_callback(avlog_cb);
-    av_log_set_level(AV_LOG_QUIET);
+    av_log_set_level(AV_LOG_DEBUG);
 
     // Open file
     FormatContext=NULL;
